@@ -1,0 +1,154 @@
+name: Sync VPN sources and Surge proxies
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-vpn-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Diandianyyy/vpn'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out destination repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+
+      - name: Fetch only dd and sini
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+          for name in dd sini; do
+            curl --fail --silent --show-error --location \
+              --proto '=https' --proto-redir '=https' \
+              --retry 3 --connect-timeout 20 --max-time 120 \
+              "https://raw.githubusercontent.com/steventaohb/vpn/main/$name" \
+              --output "$tmpdir/$name"
+          done
+          # Replace local files only after both downloads succeed.
+          cp "$tmpdir/dd" dd
+          cp "$tmpdir/sini" sini
+
+      - name: Convert dd Trojan URLs to Surge proxy list
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+          from urllib.parse import parse_qs, unquote, urlsplit
+
+          def quoted(value):
+              return json.dumps(str(value), ensure_ascii=False)
+
+          def reject_controls(value, label):
+              if any(ord(c) < 32 or ord(c) == 127 for c in value):
+                  raise ValueError(f"Control character in {label}")
+              return value
+
+          output = []
+          used_names = set()
+          for line_number, raw in enumerate(Path('dd').read_text(encoding='utf-8-sig').splitlines(), 1):
+              line = raw.strip()
+              if not line.lower().startswith('trojan://'):
+                  continue
+              try:
+                  url = urlsplit(line)
+                  if url.scheme.lower() != 'trojan' or not url.hostname:
+                      raise ValueError('Missing Trojan server')
+                  if url.username is None:
+                      raise ValueError('Missing Trojan password')
+                  # Trojan credentials are a single password, not user:password.
+                  if url.password is not None:
+                      raise ValueError('Literal colon in password must be percent-encoded')
+                  password = reject_controls(unquote(url.username), 'password')
+                  server = reject_controls(url.hostname, 'server')
+                  port = url.port or 443
+                  if not 1 <= port <= 65535:
+                      raise ValueError('Invalid port')
+                  query = parse_qs(url.query, keep_blank_values=True)
+
+                  def get(key):
+                      return reject_controls(query.get(key, [''])[0], key)
+
+                  name = reject_controls(unquote(url.fragment), 'node name') or f'{server}:{port}'
+                  # Surge names are left-hand identifiers; fail rather than silently rename.
+                  if name != name.strip() or any(c in name for c in '=,\r\n') or name.startswith(('#', ';', '//', '[')):
+                      raise ValueError('Node name cannot safely be represented in Surge')
+                  # Keep every distinct source name unchanged; suffix only collisions.
+                  base = name
+                  index = 2
+                  while name in used_names:
+                      name = f'{base} ({index})'
+                      index += 1
+                  used_names.add(name)
+
+                  if not re.fullmatch(r'[A-Za-z0-9._:\-]+', server):
+                      raise ValueError('Invalid server characters')
+                  address = f'[{server}]' if ':' in server else server
+                  fields = ['trojan', address, str(port), f'password={quoted(password)}']
+                  sni = get('sni') or get('peer')
+                  if sni:
+                      fields.append(f'sni={quoted(sni)}')
+
+                  plugin = get('plugin')
+                  plugin_parts = [part.strip() for part in plugin.split(';') if part.strip()]
+                  plugin_options = {}
+                  for part in plugin_parts:
+                      if '=' in part:
+                          key, value = part.split('=', 1)
+                          plugin_options[key.lower()] = value
+                  transport = (get('type') or get('obfs') or plugin_options.get('obfs', '')).lower()
+                  websocket = transport in ('ws', 'websocket') or plugin.lower() in ('ws', 'websocket') or any(part.lower() in ('ws', 'websocket') for part in plugin_parts)
+                  if transport and transport not in ('ws', 'websocket', 'tcp', 'none'):
+                      raise ValueError('Unsupported Trojan transport')
+                  if plugin and not websocket:
+                      raise ValueError('Unsupported Trojan plugin')
+                  if websocket:
+                      host = get('host') or get('obfs-host') or plugin_options.get('obfs-host', '') or plugin_options.get('host', '')
+                      path = get('path') or get('uri') or plugin_options.get('uri', '') or plugin_options.get('path', '') or '/'
+                      reject_controls(host, 'WebSocket host')
+                      reject_controls(path, 'WebSocket path')
+                      fields.extend(['ws=true', f'ws-path={quoted(path)}'])
+                      if host:
+                          fields.append(f'ws-headers={quoted("Host:" + host)}')
+                  insecure = (get('allowInsecure') or get('insecure')).lower()
+                  if insecure in ('1', 'true', 'yes'):
+                      fields.append('skip-cert-verify=true')
+                  output.append(f'{name} = ' + ', '.join(fields))
+              except (ValueError, UnicodeError) as exc:
+                  # Do not include the subscription URL or password in runner logs.
+                  raise SystemExit(f'Cannot convert dd line {line_number}: {exc}') from None
+
+          if not output:
+              raise SystemExit('No Trojan URL lines found in dd; refusing to overwrite output')
+          Path('surge-proxies.list').write_text('\n'.join(output) + '\n', encoding='utf-8')
+          print(f'Converted {len(output)} Trojan nodes; all output names are unique.')
+          PY
+
+      - name: Commit and push only generated files if changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -- dd sini surge-proxies.list
+          if git diff --cached --quiet; then
+            echo 'No changes.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Sync dd and sini; update Surge proxies'
+          # Ordinary push only: concurrent changes or branch protection fail safely.
+          git push origin "HEAD:${{ github.event.repository.default_branch }}"
